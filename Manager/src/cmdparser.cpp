@@ -107,11 +107,98 @@ namespace AkVCam {
         }
     }
 #elif _WIN32
-    // Windows implementation would go here (e.g., using Media Foundation or DirectShow)
-    // For now, returning dummy data for Windows to allow compilation
-    cameras.push_back({"win_cam_id_01", "Windows Dummy Webcam 1"});
-    cameras.push_back({"win_cam_id_02", "Windows Dummy Webcam 2"});
-    AkLogWarn() << "list_physical_cameras_impl: Windows implementation is a STUB, returning dummy data." << std::endl;
+    // Windows implementation using Media Foundation
+#include <windows.h>
+#include <mfapi.h>
+#include <mfidl.h>
+#include <mfreadwrite.h>
+#include <shlwapi.h> // For StrRetToBuf
+#include <propsys.h> // For IPropertyStore (though MFGetAttributeString might be enough)
+
+#pragma comment(lib, "mfplat")
+#pragma comment(lib, "mfreadwrite")
+#pragma comment(lib, "mfuuid")
+#pragma comment(lib, "shlwapi")
+#pragma comment(lib, "propsys")
+
+
+    HRESULT hr = CoInitializeEx(NULL, COINIT_APARTMENTTHREADED | COINIT_DISABLE_OLE1DDE);
+    if (SUCCEEDED(hr)) {
+        hr = MFStartup(MF_VERSION, MFSTARTUP_FULL);
+        if (SUCCEEDED(hr)) {
+            IMFAttributes* pAttributes = NULL;
+            hr = MFCreateAttributes(&pAttributes, 1);
+            if (SUCCEEDED(hr)) {
+                hr = pAttributes->SetGUID(
+                    MF_DEVSOURCE_ATTRIBUTE_SOURCE_TYPE,
+                    MF_DEVSOURCE_ATTRIBUTE_SOURCE_TYPE_VIDCAP_GUID
+                );
+            }
+
+            IMFActivate** ppDevices = NULL;
+            UINT32 count = 0;
+            if (SUCCEEDED(hr)) {
+                hr = MFEnumDeviceSources(pAttributes, &ppDevices, &count);
+            }
+
+            if (SUCCEEDED(hr)) {
+                for (UINT32 i = 0; i < count; i++) {
+                    PhysicalCamera cam;
+                    WCHAR* pszFriendlyName = NULL;
+                    WCHAR* pszSymbolicLink = NULL; // Unique ID
+
+                    hr = ppDevices[i]->GetAllocatedString(
+                        MF_DEVSOURCE_ATTRIBUTE_FRIENDLY_NAME,
+                        &pszFriendlyName,
+                        NULL
+                    );
+                    if (FAILED(hr)) {
+                        AkLogWarn() << "list_physical_cameras_impl: Failed to get friendly name for device " << i << std::endl;
+                        pszFriendlyName = L"Unknown Camera"; // Fallback
+                    }
+
+                    hr = ppDevices[i]->GetAllocatedString(
+                        MF_DEVSOURCE_ATTRIBUTE_SOURCE_TYPE_VIDCAP_SYMBOLIC_LINK,
+                        &pszSymbolicLink,
+                        NULL
+                    );
+                     if (FAILED(hr)) {
+                        AkLogWarn() << "list_physical_cameras_impl: Failed to get symbolic link for device " << i << std::endl;
+                        // Create a fallback ID if symbolic link fails, though it's critical
+                        std::wstring fallback_id = L"WIN_CAM_FALLBACK_ID_" + std::to_wstring(i);
+                        pszSymbolicLink = (WCHAR*)CoTaskMemAlloc((fallback_id.length() + 1) * sizeof(WCHAR));
+                        if(pszSymbolicLink) wcscpy_s(pszSymbolicLink, fallback_id.length() + 1, fallback_id.c_str()); else continue;
+                    }
+
+                    char friendlyNameStr[256] = {0};
+                    WideCharToMultiByte(CP_UTF8, 0, pszFriendlyName, -1, friendlyNameStr, sizeof(friendlyNameStr) -1, NULL, NULL);
+                    cam.name = friendlyNameStr;
+
+                    char symbolicLinkStr[512] = {0}; // Symbolic links can be long
+                    WideCharToMultiByte(CP_UTF8, 0, pszSymbolicLink, -1, symbolicLinkStr, sizeof(symbolicLinkStr) -1, NULL, NULL);
+                    cam.id = symbolicLinkStr;
+
+                    cameras.push_back(cam);
+                    AkLogInfo() << "list_physical_cameras_impl: Found Windows camera: ID=" << cam.id << ", Name=" << cam.name << std::endl;
+
+                    CoTaskMemFree(pszFriendlyName);
+                    CoTaskMemFree(pszSymbolicLink);
+                    ppDevices[i]->Release();
+                }
+                CoTaskMemFree(ppDevices);
+            } else {
+                 AkLogError() << "list_physical_cameras_impl: MFEnumDeviceSources failed with HRESULT: " << std::hex << hr << std::endl;
+            }
+
+            if (pAttributes) pAttributes->Release();
+            MFShutdown();
+        } else {
+             AkLogError() << "list_physical_cameras_impl: MFStartup failed with HRESULT: " << std::hex << hr << std::endl;
+        }
+        CoUninitialize();
+    } else {
+        AkLogError() << "list_physical_cameras_impl: CoInitializeEx failed with HRESULT: " << std::hex << hr << std::endl;
+    }
 #else
     // Linux or other platforms - returning dummy data
     cameras.push_back({"other_cam_id_01", "Other OS Dummy Webcam 1"});

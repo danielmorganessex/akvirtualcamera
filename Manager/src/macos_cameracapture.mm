@@ -102,22 +102,74 @@ static AkVCam::VideoFrame convertCMSampleBufferToVideoFrame(CMSampleBufferRef sa
             // Copy UV plane (Chroma)
             uint8_t* uvDest = destBuffer + (width * height); // UV data starts after Y data in NV12 format
             for (size_t i = 0; i < uvHeight; ++i) {
-                 // NV12's UV plane width is the same as Y plane for data, but height is half. Bytes per row might include padding.
-                if ((i * width) + width > (destBufferSize - (width*height)) ) { AkLogError() << "NV12 UV plane copy out of bounds"; break; }
-                memcpy(uvDest + (i * width), uvPlane + (i * uvBytesPerRow), width); // width for UV is correct as it's interleaved U and V
+                 // NV12's UV plane width is the same as Y plane for data (it contains U and V interleaved), but height is half.
+                 // Bytes per row might include padding.
+                size_t uv_row_size_to_copy = width; // For NV12, UV plane effective width is same as Y
+                if ((i * uv_row_size_to_copy) + uv_row_size_to_copy > (destBufferSize - (width*height)) ) {
+                    AkLogError() << "NV12 UV plane copy out of bounds: i=" << i << ", uv_row_size_to_copy=" << uv_row_size_to_copy
+                                 << ", available=" << (destBufferSize - (width*height));
+                    break;
+                }
+                memcpy(uvDest + (i * uv_row_size_to_copy), uvPlane + (i * uvBytesPerRow), uv_row_size_to_copy);
             }
         } else {
-            AkLogWarn() << "convertCMSampleBufferToVideoFrame: NV12 format expected 2 planes, got " << CVPixelBufferGetPlaneCount(imageBuffer) << std::endl;
+            AkLogWarn() << "convertCMSampleBufferToVideoFrame: NV12 format expected 2 planes, got " << CVPixelBufferGetPlaneCount(imageBuffer) << ". Falling back to simple copy." << std::endl;
             memcpy(destBuffer, CVPixelBufferGetBaseAddress(imageBuffer), std::min(destBufferSize, CVPixelBufferGetDataSize(imageBuffer)));
         }
     } else if (fourcc == AkVCam::PixelFormatI420) {
-        // I420 is tri-planar Y, U, V. This is more complex.
-        // TODO: Implement proper I420 copying (Y plane, then U plane, then V plane)
-        // For now, using simplified copy which will be incorrect.
-         AkLogWarn() << "convertCMSampleBufferToVideoFrame: I420 format handling is simplified and likely incorrect." << std::endl;
-        memcpy(destBuffer, CVPixelBufferGetBaseAddress(imageBuffer), std::min(destBufferSize, CVPixelBufferGetDataSize(imageBuffer)));
+        // I420 is tri-planar Y, U, V.
+        if (CVPixelBufferGetPlaneCount(imageBuffer) >= 3) {
+            // Y Plane
+            uint8_t* yPlaneSrc = (uint8_t*)CVPixelBufferGetBaseAddressOfPlane(imageBuffer, 0);
+            size_t yHeightSrc = CVPixelBufferGetHeightOfPlane(imageBuffer, 0);
+            size_t yBytesPerRowSrc = CVPixelBufferGetBytesPerRowOfPlane(imageBuffer, 0);
+            for (size_t i = 0; i < yHeightSrc; ++i) {
+                if ((i * width) + width > destBufferSize) { AkLogError() << "I420 Y plane copy out of bounds"; break; }
+                memcpy(destBuffer + (i * width), yPlaneSrc + (i * yBytesPerRowSrc), width);
+            }
+
+            // U Plane (Cb)
+            uint8_t* uPlaneSrc = (uint8_t*)CVPixelBufferGetBaseAddressOfPlane(imageBuffer, 1);
+            size_t uHeightSrc = CVPixelBufferGetHeightOfPlane(imageBuffer, 1); // Should be height/2
+            size_t uBytesPerRowSrc = CVPixelBufferGetBytesPerRowOfPlane(imageBuffer, 1); // Should be width/2
+            uint8_t* uDest = destBuffer + (width * height);
+            size_t uWidth = width / 2; // I420 U plane width
+            for (size_t i = 0; i < uHeightSrc; ++i) {
+                if ((i * uWidth) + uWidth > (destBufferSize - (width*height)) ) { AkLogError() << "I420 U plane copy out of bounds"; break; }
+                memcpy(uDest + (i * uWidth), uPlaneSrc + (i * uBytesPerRowSrc), uWidth);
+            }
+
+            // V Plane (Cr)
+            uint8_t* vPlaneSrc = (uint8_t*)CVPixelBufferGetBaseAddressOfPlane(imageBuffer, 2);
+            size_t vHeightSrc = CVPixelBufferGetHeightOfPlane(imageBuffer, 2); // Should be height/2
+            size_t vBytesPerRowSrc = CVPixelBufferGetBytesPerRowOfPlane(imageBuffer, 2); // Should be width/2
+            uint8_t* vDest = destBuffer + (width * height) + (uWidth * uHeightSrc); // V data after U data
+            size_t vWidth = width / 2; // I420 V plane width
+            for (size_t i = 0; i < vHeightSrc; ++i) {
+                if ((i * vWidth) + vWidth > (destBufferSize - (width*height) - (uWidth*uHeightSrc)) ) { AkLogError() << "I420 V plane copy out of bounds"; break; }
+                memcpy(vDest + (i * vWidth), vPlaneSrc + (i * vBytesPerRowSrc), vWidth);
+            }
+        } else {
+            AkLogWarn() << "convertCMSampleBufferToVideoFrame: I420 format expected 3 planes, got " << CVPixelBufferGetPlaneCount(imageBuffer) << ". Falling back to simple copy." << std::endl;
+            memcpy(destBuffer, CVPixelBufferGetBaseAddress(imageBuffer), std::min(destBufferSize, CVPixelBufferGetDataSize(imageBuffer)));
+        }
+    } else if (fourcc == AkVCam::PixelFormatYUY2) { // Packed YUV 4:2:2
+        // YUY2 is packed, similar to RGB/BGRA in terms of being non-planar from CVPixelBuffer's perspective usually
+        void* baseAddress = CVPixelBufferGetBaseAddress(imageBuffer);
+        size_t sourceBufferSize = CVPixelBufferGetDataSize(imageBuffer);
+        // YUY2 size is width * height * 2
+        if (destBufferSize == sourceBufferSize && destBufferSize == (size_t)width * height * 2) {
+            memcpy(destBuffer, baseAddress, sourceBufferSize);
+        } else if (destBufferSize <= sourceBufferSize) { // If AkVCam::VideoFrame expects exact size
+             AkLogWarn() << "convertCMSampleBufferToVideoFrame: YUY2 size mismatch or CVPixelBufferGetDataSize includes padding. Dest: " << destBufferSize << ", Source: " << sourceBufferSize << ", Expected YUY2: " << (width*height*2) << ". Copying destBufferSize." << std::endl;
+            memcpy(destBuffer, baseAddress, destBufferSize);
+        }
+        else {
+             AkLogWarn() << "convertCMSampleBufferToVideoFrame: YUY2 frame data size mismatch. Dest: " << destBufferSize << ", Source: " << sourceBufferSize << ". Copying min." << std::endl;
+             memcpy(destBuffer, baseAddress, std::min(destBufferSize, sourceBufferSize));
+        }
     }
-    else if (!CVPixelBufferIsPlanar(imageBuffer)) { // Packed formats like BGRA, RGB24, YUY2
+    else if (!CVPixelBufferIsPlanar(imageBuffer)) { // Other Packed formats like BGRA, RGB24
         void* baseAddress = CVPixelBufferGetBaseAddress(imageBuffer);
         size_t sourceBufferSize = CVPixelBufferGetDataSize(imageBuffer);
         if (destBufferSize == sourceBufferSize) {
@@ -407,9 +459,14 @@ std::unique_ptr<ICameraCapture> create_platform_camera_capture() {
 #ifdef __APPLE__
     return std::make_unique<MacOSCameraCapture>();
 #elif _WIN32
-    // TODO: Return std::make_unique<WindowsCameraCapture>(); when implemented
-    AkLogError() << "create_platform_camera_capture: WindowsCameraCapture not implemented yet." << std::endl;
-    return nullptr;
+    // Forward declare WindowsCameraCapture if its definition is in another file and not yet seen
+    // class WindowsCameraCapture; // This would require WindowsCameraCapture to be defined for the linker
+    // For now, this will only compile if WindowsCameraCapture is defined *before* this point
+    // when compiling for Windows. This implies windows_cameracapture.cpp should be compiled first or
+    // the class definition needs to be available.
+    // To make this work cleanly, WindowsCameraCapture definition should be available.
+    // Assuming windows_cameracapture.cpp defines it and is part of the same target.
+    return std::make_unique<WindowsCameraCapture>();
 #else
     AkLogError() << "create_platform_camera_capture: Platform not supported for camera capture." << std::endl;
     return nullptr;

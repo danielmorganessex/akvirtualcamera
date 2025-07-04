@@ -39,9 +39,14 @@ if (APPLE OR FAKE_APPLE)
     set_target_properties(Manager PROPERTIES
                           OUTPUT_NAME ${AKVCAM_MANAGER_NAME}
                           RUNTIME_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR}/${BUILDDIR}/${DATAROOTDIR})
+elseif (WIN32)
+    target_sources(Manager PRIVATE src/windows_cameracapture.cpp)
+    set_target_properties(Manager PROPERTIES
+                          OUTPUT_NAME ${AKVCAM_MANAGER_NAME}
+                          LIBRARY_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR}/${BUILDDIR}/${BINDIR}
+                          RUNTIME_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR}/${BUILDDIR}/${BINDIR})
 else ()
-    # Add a stub or empty WindowsCameraCapture.cpp if you want to compile on Windows without full features yet
-    # target_sources(Manager PRIVATE src/windows_cameracapture.cpp)
+    # For other platforms, if any specific capture implementation is added later
     set_target_properties(Manager PROPERTIES
                           OUTPUT_NAME ${AKVCAM_MANAGER_NAME}
                           LIBRARY_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR}/${BUILDDIR}/${BINDIR}
@@ -104,14 +109,23 @@ elseif (WIN32)
     # mfplat.lib, mfreadwrite.lib, mfuuid.lib, Shlwapi.lib, ole32.lib, propsys.lib
     # For DirectShow, you'd need:
     # strmiids.lib, ole32.lib, oleaut32.lib, user32.lib, propsys.lib (for KsPropertySet)
+    # For Media Foundation (added for list_physical_cameras_impl)
     target_link_libraries(Manager
+                          PRIVATE # Use PRIVATE if these are impl details
                           advapi32
                           gdi32
                           ole32
                           oleaut32
                           shell32
-                          strmiids
-                          uuid)
+                          strmiids # DShow, might still be needed by other VCamUtils parts
+                          uuid     # DShow
+                          # Media Foundation libs
+                          mfplat
+                          mfreadwrite
+                          mfuuid
+                          shlwapi  # For StrRetToBuf used in MF example, might not be strictly needed by MF itself always
+                          propsys  # For IPropertyStore, also sometimes used with MF/DShow
+                          )
 endif ()
 
 if (APPLE OR FAKE_APPLE)
