@@ -58,3 +58,24 @@ namespace AkVCam {
 }
 
 #endif // CMDPARSER_H
+
+// Helper function to be implemented for listing physical cameras
+// This is a placeholder and will need platform-specific implementation details.
+namespace AkVCam {
+    struct PhysicalCamera {
+        std::string id;
+        std::string name;
+        // Other relevant details like model, manufacturer, or path if available
+    };
+    std::vector<PhysicalCamera> list_physical_cameras_impl();
+
+    // Structure to hold information about a webcam split configuration
+    struct WebcamSplitConfig {
+        std::string physical_camera_id;
+        std::string physical_camera_name; // For convenience
+        int num_splits;
+        std::string base_name_prefix;
+        std::vector<std::string> virtual_camera_ids;
+        bool is_active; // Is it currently streaming?
+    };
+}

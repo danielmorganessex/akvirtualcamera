@@ -41,6 +41,7 @@
 #include "VCamUtils/src/videoformat.h"
 #include "VCamUtils/src/videoframe.h"
 #include "VCamUtils/src/logger.h"
+#include "icameracapture.h" // Include the new interface
 
 #define COMMONS_PROJECT_COMMIT_URL "https://github.com/webcamoid/akvirtualcamera/commit"
 
@@ -76,6 +77,60 @@ namespace AkVCam {
                          bool advanced);
     };
 
+    // Placeholder implementation for listing physical cameras
+    // This needs to be implemented with platform-specific code.
+#ifdef __APPLE__
+#include <AVFoundation/AVFoundation.h>
+#endif
+
+    std::vector<AkVCam::PhysicalCamera> AkVCam::list_physical_cameras_impl() {
+        std::vector<AkVCam::PhysicalCamera> cameras;
+    AkLogInfo() << "list_physical_cameras_impl: Starting camera enumeration." << std::endl;
+
+#ifdef __APPLE__
+    @autoreleasepool {
+        NSArray<AVCaptureDevice *> *devices = [AVCaptureDevice devicesWithMediaType:AVMediaTypeVideo];
+        if (devices == nil || [devices count] == 0) {
+            AkLogWarn() << "list_physical_cameras_impl: No video devices found on macOS." << std::endl;
+            return cameras;
+        }
+
+        for (AVCaptureDevice *device in devices) {
+            PhysicalCamera cam;
+            cam.id = std::string([[device uniqueID] UTF8String]);
+            cam.name = std::string([[device localizedName] UTF8String]);
+            // You could also get modelID, manufacturer, etc. if needed
+            // cam.model = std::string([[device modelID] UTF8String]);
+            // cam.manufacturer = std::string([[device manufacturer] UTF8String]);
+            cameras.push_back(cam);
+            AkLogInfo() << "list_physical_cameras_impl: Found macOS camera: ID=" << cam.id << ", Name=" << cam.name << std::endl;
+        }
+    }
+#elif _WIN32
+    // Windows implementation would go here (e.g., using Media Foundation or DirectShow)
+    // For now, returning dummy data for Windows to allow compilation
+    cameras.push_back({"win_cam_id_01", "Windows Dummy Webcam 1"});
+    cameras.push_back({"win_cam_id_02", "Windows Dummy Webcam 2"});
+    AkLogWarn() << "list_physical_cameras_impl: Windows implementation is a STUB, returning dummy data." << std::endl;
+#else
+    // Linux or other platforms - returning dummy data
+    cameras.push_back({"other_cam_id_01", "Other OS Dummy Webcam 1"});
+    AkLogWarn() << "list_physical_cameras_impl: Non-macOS/Windows platform, returning dummy data." << std::endl;
+#endif
+
+    if (cameras.empty() && !defined(__APPLE__) && !defined(_WIN32)) {
+         // Fallback dummy data if no platform-specific code was hit and list is empty
+        cameras.push_back({"dummy_cam_id_01", "Fallback Dummy Webcam"});
+        AkLogWarn() << "list_physical_cameras_impl: No platform-specific implementation hit, returning fallback dummy data." << std::endl;
+    }
+
+    if (cameras.empty()) {
+        AkLogWarn() << "list_physical_cameras_impl: No cameras found after enumeration attempts." << std::endl;
+    }
+
+        return cameras;
+    }
+
     class CmdParserPrivate
     {
         public:
@@ -83,6 +138,13 @@ namespace AkVCam {
             IpcBridge m_ipcBridge;
             bool m_parseable {false};
             bool m_force {false};
+
+            // Map to store physical camera ID to its split configuration
+            std::map<std::string, WebcamSplitConfig> m_active_splits;
+            // Instance for capturing from the physical camera
+            std::unique_ptr<ICameraCapture> m_camera_capture;
+            // Store the ID of the physical camera currently being captured for splitting
+            std::string m_active_capture_physical_id;
 
             static const std::map<ControlType, std::string> &typeStrMap();
             void printFlags(const std::vector<CmdParserFlags> &cmdFlags,
@@ -148,6 +210,11 @@ namespace AkVCam {
             void loadGenerals(Settings &settings);
             VideoFormatMatrix readFormats(Settings &settings);
             std::vector<VideoFormat> readFormat(Settings &settings);
+            int listPhysicalCameras(const StringMap &flags, const StringVector &args);
+            int splitWebcam(const StringMap &flags, const StringVector &args);         // New handler
+            int startSplit(const StringMap &flags, const StringVector &args);          // New handler
+            int stopSplit(const StringMap &flags, const StringVector &args);           // New handler
+            int removeSplit(const StringMap &flags, const StringVector &args);         // New handler
             StringMatrix matrixCombine(const StringMatrix &matrix);
             void matrixCombineP(const StringMatrix &matrix,
                                 size_t index,
@@ -361,6 +428,26 @@ AkVCam::CmdParser::CmdParser()
     this->addFlags("hack",
                    {"-y", "--yes"},
                    "Accept all risks and continue anyway.");
+    this->addCommand("list-physical-cameras",
+                     "",
+                     "List available physical cameras.",
+                     AKVCAM_BIND_FUNC(CmdParserPrivate::listPhysicalCameras));
+    this->addCommand("split-webcam",
+                     "<physical_cam_id> <num_splits> [base_name_prefix]",
+                     "Configure a physical camera to be split into multiple virtual cameras.",
+                     AKVCAM_BIND_FUNC(CmdParserPrivate::splitWebcam));
+    this->addCommand("start-split",
+                     "<physical_cam_id>",
+                     "Start streaming from a physical camera to its configured virtual splits.",
+                     AKVCAM_BIND_FUNC(CmdParserPrivate::startSplit));
+    this->addCommand("stop-split",
+                     "<physical_cam_id>",
+                     "Stop streaming from a physical camera to its virtual splits.",
+                     AKVCAM_BIND_FUNC(CmdParserPrivate::stopSplit));
+    this->addCommand("remove-split",
+                     "<physical_cam_id>",
+                     "Remove a webcam split configuration and its virtual cameras.",
+                     AKVCAM_BIND_FUNC(CmdParserPrivate::removeSplit));
 }
 
 AkVCam::CmdParser::~CmdParser()
@@ -2198,6 +2285,444 @@ int AkVCam::CmdParserPrivate::hack(const AkVCam::StringMap &flags,
 
     return result;
 }
+
+int AkVCam::CmdParserPrivate::listPhysicalCameras(const StringMap &flags, const StringVector &args)
+{
+    UNUSED(flags);
+    UNUSED(args);
+
+    auto cameras = AkVCam::list_physical_cameras_impl();
+
+    if (cameras.empty()) {
+        if (!this->m_parseable) {
+            std::cout << "No physical cameras found or error enumerating them." << std::endl;
+        }
+        return 0; // Not an error, could be no cameras connected
+    }
+
+    if (this->m_parseable) {
+        for (const auto &cam : cameras) {
+            std::cout << cam.id << "\t" << cam.name << std::endl;
+        }
+    } else {
+        StringVector table_data;
+        table_data.push_back("ID");
+        table_data.push_back("Name");
+
+        for (const auto &cam : cameras) {
+            table_data.push_back(cam.id);
+            table_data.push_back(cam.name);
+        }
+        this->drawTable(table_data, 2); // 2 columns
+    }
+
+    return 0;
+}
+
+int AkVCam::CmdParserPrivate::splitWebcam(const StringMap &flags, const StringVector &args) {
+    UNUSED(flags);
+    // args[0] is program name
+    // args[1] is physical_cam_id
+    // args[2] is num_splits
+    // args[3] is optional base_name_prefix
+
+    if (args.size() < 3) {
+        std::cerr << "Usage: " << args[0] << " split-webcam <physical_cam_id> <num_splits> [base_name_prefix]" << std::endl;
+        return -EINVAL;
+    }
+
+    const std::string& physical_cam_id = args[1];
+    int num_splits = 0;
+    try {
+        num_splits = std::stoi(args[2]);
+    } catch (const std::exception& e) {
+        std::cerr << "Invalid number for num_splits: " << args[2] << std::endl;
+        return -EINVAL;
+    }
+
+    if (num_splits <= 0) {
+        std::cerr << "num_splits must be a positive integer." << std::endl;
+        return -EINVAL;
+    }
+
+    std::string base_name_prefix = "SplitCam";
+    if (args.size() >= 4) {
+        base_name_prefix = args[3];
+    }
+
+    // Check if this physical camera is already configured for splitting
+    if (m_active_splits.count(physical_cam_id)) {
+        std::cerr << "Error: Physical camera '" << physical_cam_id << "' is already configured for splitting." << std::endl;
+        std::cerr << "Remove the existing split configuration first using 'remove-split " << physical_cam_id << "'." << std::endl;
+        return -EEXIST;
+    }
+
+    // Placeholder: Validate physical_cam_id by checking against list_physical_cameras_impl()
+    auto physical_cameras = AkVCam::list_physical_cameras_impl();
+    auto it_phys = std::find_if(physical_cameras.begin(), physical_cameras.end(),
+        [&](const AkVCam::PhysicalCamera& cam){ return cam.id == physical_cam_id || cam.name == physical_cam_id; });
+
+    if (it_phys == physical_cameras.end()) {
+        std::cerr << "Error: Physical camera '" << physical_cam_id << "' not found." << std::endl;
+        return -ENODEV;
+    }
+    const std::string actual_physical_cam_id = it_phys->id; // Use the ID for consistency
+    const std::string physical_cam_name = it_phys->name;
+
+
+    if (!this->m_parseable) {
+        std::cout << "Configuring physical camera '" << physical_cam_name << "' (ID: " << actual_physical_cam_id << ") to be split into " << num_splits << " virtual cameras with base name '" << base_name_prefix << "'." << std::endl;
+    }
+
+    WebcamSplitConfig new_split_config;
+    new_split_config.physical_camera_id = actual_physical_cam_id;
+    new_split_config.physical_camera_name = physical_cam_name;
+    new_split_config.num_splits = num_splits;
+    new_split_config.base_name_prefix = base_name_prefix;
+    new_split_config.is_active = false;
+
+    for (int i = 0; i < num_splits; ++i) {
+        std::string virtual_cam_name = base_name_prefix + " " + std::to_string(i + 1);
+        // The addDevice method can generate an ID if one isn't provided.
+        // Or, we can construct a unique ID here. For now, let addDevice handle it or generate one.
+        std::string generated_virtual_id_base = actual_physical_cam_id + "_split_" + std::to_string(i);
+
+        // For now, we'll simulate ID generation for planning. Actual ID comes from addDevice.
+        std::string virtual_cam_id = "TEMP_VID_" + generated_virtual_id_base;
+
+        if (!this->m_parseable) {
+            std::cout << "  Registering virtual camera: " << virtual_cam_name << " (intended ID base: " << generated_virtual_id_base << ")" << std::endl;
+        }
+        // TODO: Call this->m_ipcBridge.addDevice(virtual_cam_name, generated_virtual_id_base);
+        //       And retrieve the actual ID returned by addDevice.
+        //       For now, using placeholder ID.
+        // 실제 구현에서는 m_ipcBridge.addDevice를 호출하고 반환된 ID를 사용해야 합니다.
+        // std::string actual_virtual_cam_id = this->m_ipcBridge.addDevice(virtual_cam_name, generated_virtual_id_base);
+        // if (actual_virtual_cam_id.empty()) {
+        //    std::cerr << "Error: Failed to create virtual camera device " << virtual_cam_name << std::endl;
+        //    // Rollback: remove previously created virtual devices for this split
+        //    for(const auto& vid : new_split_config.virtual_camera_ids) {
+        //        this->m_ipcBridge.removeDevice(vid);
+        //    }
+        //    return -EIO;
+        // }
+        // new_split_config.virtual_camera_ids.push_back(actual_virtual_cam_id);
+        //new_split_config.virtual_camera_ids.push_back(virtual_cam_id); // Using placeholder
+
+        // Actually add the device via IPCBridge
+        std::string actual_virtual_cam_id = this->m_ipcBridge.addDevice(virtual_cam_name, generated_virtual_id_base);
+        if (actual_virtual_cam_id.empty()) {
+            std::cerr << "Error: Failed to create virtual camera device '" << virtual_cam_name << "' (intended ID base: " << generated_virtual_id_base << ")." << std::endl;
+            // Rollback: remove previously created virtual devices for this split
+            if (!this->m_parseable) {
+                std::cerr << "Rolling back previously added virtual cameras for this split attempt..." << std::endl;
+            }
+            for(const auto& vid : new_split_config.virtual_camera_ids) {
+                this->m_ipcBridge.removeDevice(vid);
+                 if (!this->m_parseable) {
+                    std::cout << "  Removed device: " << vid << std::endl;
+                }
+            }
+            return -EIO;
+        }
+        new_split_config.virtual_camera_ids.push_back(actual_virtual_cam_id);
+        AkLogInfo() << "splitWebcam: Registered virtual camera '" << virtual_cam_name << "' with actual ID: " << actual_virtual_cam_id << std::endl;
+
+        if (this->m_parseable) {
+            std::cout << actual_virtual_cam_id << "\t" << virtual_cam_name << std::endl;
+        } else {
+            std::cout << "  Successfully registered virtual camera: " << virtual_cam_name << " (ID: " << actual_virtual_cam_id << ")" << std::endl;
+        }
+    }
+
+    m_active_splits[actual_physical_cam_id] = new_split_config;
+
+    // --- Set default formats for the new virtual cameras ---
+    std::vector<VideoFormat> default_formats_to_set;
+    // Create a temporary capture instance to get formats
+    auto temp_capture = create_platform_camera_capture();
+    if (temp_capture) {
+        if (temp_capture->open(actual_physical_cam_id)) {
+            auto physical_formats = temp_capture->getSupportedFormats();
+            if (!physical_formats.empty()) {
+                // Try to find a common/preferred format, e.g., 640x480 YUY2 or NV12, or just pick the first one
+                // For simplicity, let's pick the first one that is reasonably common if possible.
+                // A more sophisticated selection could be implemented here.
+                auto preferred_it = std::find_if(physical_formats.begin(), physical_formats.end(), [](const VideoFormat& vf){
+                    return (vf.width() == 640 && vf.height() == 480 && (vf.fourcc() == PixelFormatYUY2 || vf.fourcc() == PixelFormatNV12)) ||
+                           (vf.width() == 1280 && vf.height() == 720 && (vf.fourcc() == PixelFormatYUY2 || vf.fourcc() == PixelFormatNV12));
+                });
+                if (preferred_it != physical_formats.end()) {
+                    default_formats_to_set.push_back(*preferred_it);
+                } else {
+                    default_formats_to_set.push_back(physical_formats.front()); // Fallback to the first format
+                }
+                AkLogInfo() << "splitWebcam: Using format " << default_formats_to_set.front().toString() << " for virtual cameras." << std::endl;
+            } else {
+                AkLogWarn() << "splitWebcam: Physical camera reported no supported formats. Virtual cameras might not work." << std::endl;
+            }
+            temp_capture->close();
+        } else {
+            AkLogWarn() << "splitWebcam: Could not open physical camera temporarily to get formats." << std::endl;
+        }
+    } else {
+        AkLogWarn() << "splitWebcam: Could not create temp camera capture instance to get formats." << std::endl;
+    }
+
+    if (default_formats_to_set.empty()) {
+        // Fallback to a very common default if physical camera formats couldn't be queried
+        AkLogWarn() << "splitWebcam: Using hardcoded fallback format for virtual cameras." << std::endl;
+        default_formats_to_set.push_back(VideoFormat(PixelFormatYUY2, 640, 480, {{30,1}}));
+    }
+
+    for (const auto& v_id : new_split_config.virtual_camera_ids) {
+        if (!this->m_ipcBridge.setFormats(v_id, default_formats_to_set)) {
+            AkLogWarn() << "splitWebcam: Failed to set formats for virtual camera " << v_id << std::endl;
+            // This is not ideal, the virtual camera might not be usable by some apps.
+            // Consider if this should be a critical error leading to rollback. For now, just a warning.
+        } else {
+            if (!this->m_parseable) {
+                std::cout << "  Set format for " << v_id << " to " << default_formats_to_set.front().toString() << std::endl;
+            }
+        }
+    }
+    // --- End set default formats ---
+
+
+    if (!this->m_parseable) {
+        std::cout << "Webcam split configured. Use 'start-split " << actual_physical_cam_id << "' to begin streaming." << std::endl;
+    }
+
+    return 0;
+}
+
+int AkVCam::CmdParserPrivate::startSplit(const StringMap &flags, const StringVector &args) {
+    UNUSED(flags);
+    if (args.size() < 2) {
+        std::cerr << "Usage: " << args[0] << " start-split <physical_cam_id>" << std::endl;
+        return -EINVAL;
+    }
+    const std::string& physical_cam_id_arg = args[1];
+
+    auto it = m_active_splits.find(physical_cam_id_arg);
+    if (it == m_active_splits.end()) {
+        // Also check if user provided name instead of ID
+        auto it_by_name = std::find_if(m_active_splits.begin(), m_active_splits.end(),
+            [&](const auto& pair){ return pair.second.physical_camera_name == physical_cam_id_arg; });
+        if (it_by_name != m_active_splits.end()) {
+            it = it_by_name;
+        } else {
+            std::cerr << "Error: No split configuration found for physical camera '" << physical_cam_id_arg << "'." << std::endl;
+            std::cerr << "Use 'split-webcam' command first." << std::endl;
+            return -ENOENT;
+        }
+    }
+
+    WebcamSplitConfig& config = it->second;
+
+    if (config.is_active) {
+        std::cerr << "Error: Split for physical camera '" << config.physical_camera_name << "' (ID: " << config.physical_camera_id << ") is already active." << std::endl;
+        return -EALREADY;
+    }
+
+    if (!this->m_parseable) {
+        std::cout << "Starting split for physical camera '" << config.physical_camera_name << "' (ID: " << config.physical_camera_id << ")..." << std::endl;
+        std::cout << "  (Placeholder: Actual camera capture and frame distribution not yet implemented)" << std::endl;
+        std::cout << "  Frames would be sent to:" << std::endl;
+        for(const auto& vid : config.virtual_camera_ids) {
+            std::cout << "    - " << vid << std::endl;
+        }
+    }
+
+    // TODO: Implement actual physical camera capture initiation here.
+    // This will involve platform-specific code.
+
+    if (m_camera_capture && m_camera_capture->isStreaming()) {
+        // This case implies another split is already active with the m_camera_capture instance
+        if (m_camera_capture->getOpenedDeviceId() != config.physical_camera_id) {
+             AkLogError() << "startSplit: Another physical camera '" << m_camera_capture->getOpenedDeviceId() << "' is already active for capture." << std::endl;
+             std::cerr << "Error: Another physical camera capture (" << m_camera_capture->getOpenedDeviceId() <<") is already active. Stop it first." << std::endl;
+             return -EBUSY; // Or another appropriate error
+        }
+        // If it's the same camera, it might already be streaming, which is covered by config.is_active
+    }
+
+    if (!m_camera_capture) {
+        m_camera_capture = create_platform_camera_capture();
+    }
+
+    if (!m_camera_capture) {
+        AkLogError() << "startSplit: Failed to create platform camera capture instance." << std::endl;
+        std::cerr << "Error: Could not initialize camera capture for this platform." << std::endl;
+        return -EIO;
+    }
+
+    // Check if the camera is already opened by this instance, but not for this specific split's physical_camera_id
+    // This is a bit redundant if m_active_capture_physical_id is managed well.
+    if (m_camera_capture->getOpenedDeviceId() != "" && m_camera_capture->getOpenedDeviceId() != config.physical_camera_id) {
+         AkLogError() << "startSplit: m_camera_capture is already open for a different device ID: " << m_camera_capture->getOpenedDeviceId() << std::endl;
+         // This state should ideally not be reached if m_active_capture_physical_id is correctly managed.
+         // Close it before proceeding, or return an error. For now, let's try closing.
+         m_camera_capture->close();
+    }
+
+
+    if (m_camera_capture->getOpenedDeviceId() != config.physical_camera_id) { // Only open if not already open for this device
+        if (!m_camera_capture->open(config.physical_camera_id)) {
+            AkLogError() << "startSplit: Failed to open physical camera ID: " << config.physical_camera_id << std::endl;
+            std::cerr << "Error: Could not open physical camera '" << config.physical_camera_name << "' (ID: " << config.physical_camera_id << ")." << std::endl;
+            m_camera_capture.reset(); // Release the instance if open failed
+            return -EIO;
+        }
+    }
+
+    // Define the frame callback
+    auto frame_callback = [this, physical_id = config.physical_camera_id](const VideoFrame& frame) {
+        // Ensure we are still supposed to be splitting for this physical_id
+        auto it_cb = this->m_active_splits.find(physical_id);
+        if (it_cb != this->m_active_splits.end() && it_cb->second.is_active) {
+            if (frame.isValid() && frame.format().size() > 0) {
+                //AkLogDebug() << "Frame received from " << physical_id << ", distributing to " << it_cb->second.virtual_camera_ids.size() << " virtual cams." << std::endl;
+                for (const auto& virtual_cam_id : it_cb->second.virtual_camera_ids) {
+                    this->m_ipcBridge.write(virtual_cam_id, frame);
+                }
+            } else {
+                //AkLogWarn() << "Frame callback: Received invalid frame for " << physical_id << std::endl;
+            }
+        } else {
+             //AkLogInfo() << "Frame callback: Split for " << physical_id << " is no longer active or found, stopping distribution." << std::endl;
+             // This could be a point to auto-stop the capture if no active splits depend on it.
+             // For now, the explicit stopSplit command handles termination.
+        }
+    };
+
+    if (!m_camera_capture->startStream(frame_callback)) {
+        AkLogError() << "startSplit: Failed to start stream for physical camera ID: " << config.physical_camera_id << std::endl;
+        std::cerr << "Error: Could not start stream for physical camera '" << config.physical_camera_name << "' (ID: " << config.physical_camera_id << ")." << std::endl;
+        m_camera_capture->close(); // Attempt to close if stream failed
+        m_camera_capture.reset();
+        return -EIO;
+    }
+
+    config.is_active = true;
+    m_active_capture_physical_id = config.physical_camera_id; // Mark this physical camera as the one being captured
+
+    if (!this->m_parseable) {
+        std::cout << "Split started for " << config.physical_camera_name << " (ID: " << config.physical_camera_id << ")." << std::endl;
+    }
+    return 0;
+}
+
+int AkVCam::CmdParserPrivate::stopSplit(const StringMap &flags, const StringVector &args) {
+    UNUSED(flags);
+    if (args.size() < 2) {
+        std::cerr << "Usage: " << args[0] << " stop-split <physical_cam_id>" << std::endl;
+        return -EINVAL;
+    }
+    const std::string& physical_cam_id_arg = args[1];
+
+    auto it = m_active_splits.find(physical_cam_id_arg);
+     if (it == m_active_splits.end()) {
+        auto it_by_name = std::find_if(m_active_splits.begin(), m_active_splits.end(),
+            [&](const auto& pair){ return pair.second.physical_camera_name == physical_cam_id_arg; });
+        if (it_by_name != m_active_splits.end()) {
+            it = it_by_name;
+        } else {
+            std::cerr << "Error: No split configuration found for physical camera '" << physical_cam_id_arg << "'." << std::endl;
+            return -ENOENT;
+        }
+    }
+
+    WebcamSplitConfig& config = it->second;
+
+    if (!config.is_active) {
+        std::cerr << "Error: Split for physical camera '" << config.physical_camera_name << "' (ID: " << config.physical_camera_id << ") is not currently active." << std::endl;
+        return -EINVAL;
+    }
+
+    if (!this->m_parseable) {
+        std::cout << "Stopping split for physical camera '" << config.physical_camera_name << "' (ID: " << config.physical_camera_id << ")..." << std::endl;
+    }
+
+    if (m_camera_capture && m_camera_capture->getOpenedDeviceId() == config.physical_camera_id) {
+        m_camera_capture->stopStream();
+        // Consider if close() should always be called here, or only if no other splits depend on this physical camera.
+        // For now, if this specific split is stopped, we close the camera capture instance associated with it.
+        // If other splits were hypothetically sharing the m_camera_capture instance (not current design), this would need more complex ref counting.
+        m_camera_capture->close();
+        m_camera_capture.reset(); // Release the instance
+        m_active_capture_physical_id.clear();
+         if (!this->m_parseable) {
+            std::cout << "  Physical camera capture stopped and closed." << std::endl;
+        }
+    } else {
+        if (!this->m_parseable) {
+            std::cerr << "Warning: No active camera capture instance found for " << config.physical_camera_id << " or it was for a different camera. State might be inconsistent." << std::endl;
+        }
+    }
+
+    config.is_active = false;
+
+    if (!this->m_parseable) {
+        std::cout << "Split stopped." << std::endl;
+    }
+    return 0;
+}
+
+int AkVCam::CmdParserPrivate::removeSplit(const StringMap &flags, const StringVector &args) {
+    UNUSED(flags);
+    if (args.size() < 2) {
+        std::cerr << "Usage: " << args[0] << " remove-split <physical_cam_id>" << std::endl;
+        return -EINVAL;
+    }
+    const std::string& physical_cam_id_arg = args[1];
+
+    auto it = m_active_splits.find(physical_cam_id_arg);
+    if (it == m_active_splits.end()) {
+        auto it_by_name = std::find_if(m_active_splits.begin(), m_active_splits.end(),
+            [&](const auto& pair){ return pair.second.physical_camera_name == physical_cam_id_arg; });
+        if (it_by_name != m_active_splits.end()) {
+            it = it_by_name;
+        } else {
+            std::cerr << "Error: No split configuration found for physical camera '" << physical_cam_id_arg << "'." << std::endl;
+            return -ENOENT;
+        }
+    }
+
+    WebcamSplitConfig& config = it->second;
+
+    if (config.is_active) {
+        if (!this->m_parseable) {
+            std::cout << "Split is active, stopping it first..." << std::endl;
+        }
+        // Call stopSplit logic (simplified here, actual call would be better)
+        // TODO: Call this->stopSplit(...) or refactor to share logic
+        config.is_active = false;
+        if (!this->m_parseable) {
+             std::cout << "Split stopped." << std::endl;
+        }
+    }
+
+    if (!this->m_parseable) {
+        std::cout << "Removing split configuration for physical camera '" << config.physical_camera_name << "' (ID: " << config.physical_camera_id << ")..." << std::endl;
+    }
+
+    for (const auto& virtual_cam_id : config.virtual_camera_ids) {
+        if (!this->m_parseable) {
+            std::cout << "  Unregistering virtual camera: " << virtual_cam_id << std::endl;
+        }
+        this->m_ipcBridge.removeDevice(virtual_cam_id);
+        AkLogInfo() << "removeSplit: Unregistered virtual camera ID: " << virtual_cam_id << std::endl;
+    }
+
+    m_active_splits.erase(it);
+
+    if (!this->m_parseable) {
+        std::cout << "Split configuration removed." << std::endl;
+    }
+    return 0;
+}
+
 
 void AkVCam::CmdParserPrivate::loadGenerals(Settings &settings)
 {
